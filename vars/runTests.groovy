@@ -10,6 +10,8 @@
  * No package.json → warn and continue (static HTML sites).
  * Any selected script that exits non-zero → fail the build (blocks deploy).
  *
+ * Note: uses readFile + regex (no pipeline-utility-steps / readJSON required).
+ *
  * Usage:
  *   runTests()
  *   runTests(dir: '.')
@@ -24,15 +26,13 @@ def call(Map args = [:]) {
             return
         }
 
-        def pkgJson = readJSON file: pkg
-        def scripts = (pkgJson.scripts instanceof Map) ? pkgJson.scripts.keySet() as Set : [] as Set
-
+        def text = readFile(pkg)
         def chosen = null
-        if (scripts.contains('test:gate')) {
+        if (text =~ /(?m)"test:gate"\s*:/) {
             chosen = 'test:gate'
-        } else if (scripts.contains('test:all')) {
+        } else if (text =~ /(?m)"test:all"\s*:/) {
             chosen = 'test:all'
-        } else if (scripts.contains('test')) {
+        } else if (text =~ /(?m)"test"\s*:/) {
             chosen = 'test'
         }
 
