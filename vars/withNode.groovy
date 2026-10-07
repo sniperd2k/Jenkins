@@ -1,6 +1,6 @@
 /**
  * Run a closure with PATH/NODE_HOME pinned to the host Node install.
- * Default pin: C:\grok\tools\node (v22.19.0 on COMPUTER).
+ * Default pin: C:\grok\tools\node (v22.19.0 on the Windows build agent).
  *
  * Usage:
  *   withNode { bat 'npm run test:gate' }
