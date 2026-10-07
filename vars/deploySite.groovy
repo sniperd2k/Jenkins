@@ -10,7 +10,23 @@
  *   gitUrl   — full HTTPS URL (overrides repo).
  *   branch   — default env.BRANCH_NAME or 'master'
  *   credentialsId — Jenkins credential ID (placeholder default: 'github-sniperd2k')
- *   excludes — extra directory names to skip (default node_modules, .git, tests, …)
+ *   excludes — directory names to skip. REPLACES the defaults when passed
+ *              (default node_modules, .git, .github, tests, e2e, test-results,
+ *              playwright-report, coverage, .vscode, .idea)
+ *   extraExcludes — directory names APPENDED to excludes/defaults (e.g. ['scripts']).
+ *              robocopy /XD + rsync --exclude; matches that name at any depth.
+ *   excludeFiles  — file names/wildcards APPENDED to robocopy /XF (always
+ *              .gitignore .gitattributes) and rsync --exclude. Excluded files are
+ *              never copied, so a live copy on the target is never overwritten
+ *              (promote has no /MIR or --delete, so nothing is deleted either).
+ *   protectPaths  — target subpaths (relative to iisPath, e.g. ['App_Data']) whose
+ *              Everyone access is stripped AFTER the legacy cacls Everyone:f step.
+ *              Windows, per path: icacls /inheritance:d (inherited ACEs copied as
+ *              explicit, so AppPool/SYSTEM/Administrators keep access), then
+ *              icacls /remove:g *S-1-1-0 (Everyone) on the path, then /T /C over
+ *              the subtree, then verify no Everyone ACE remains. Fails the build if
+ *              icacls errors on the path itself or Everyone is still present.
+ *              Unix: no-op (the rsync promote does not loosen permissions).
  *   skipTests — if true, skip runTests (NOT recommended)
  *   siteName — label for logs
  *
@@ -33,6 +49,21 @@ def call(Map args) {
         'node_modules', '.git', '.github', 'tests', 'e2e', 'test-results',
         'playwright-report', 'coverage', '.vscode', '.idea'
     ]
+
+    // Opt-in additions (all default to [] → promote is byte-for-byte unchanged).
+    def extraExcludes = _nameList(args.extraExcludes, 'extraExcludes', false)
+    if (extraExcludes) {
+        excludes = (excludes + extraExcludes).unique()
+        echo "deploySite: extraExcludes ${extraExcludes} (dirs skipped: ${excludes})"
+    }
+    def excludeFiles = _nameList(args.excludeFiles, 'excludeFiles', true)
+    if (excludeFiles) {
+        echo "deploySite: excludeFiles ${excludeFiles} (never copied / overwritten)"
+    }
+    def protectPaths = _protectList(args.protectPaths)
+    if (protectPaths) {
+        echo "deploySite: protectPaths ${protectPaths} (Everyone stripped after cacls)"
+    }
 
     echo "=== deploySite: ${siteName} → ${iisPath} (branch=${branch}) ==="
 
@@ -63,15 +94,22 @@ def call(Map args) {
     }
 
     echo "=== Promote (FileCopy-style) → ${iisPath} ==="
-    _promote(iisPath, excludes)
+    _promote(iisPath, excludes, excludeFiles, protectPaths)
 
     echo "=== deploySite done: ${siteName} → ${iisPath} ==="
 }
 
-private void _promote(String iisPath, List excludes) {
+private void _promote(String iisPath, List excludes, List excludeFiles, List protectPaths) {
     if (isUnix()) {
         echo "WARNING: Unix agent — rsync-like copy; production promote is Windows robocopy to ${iisPath}"
         def excludeArgs = excludes.collect { "--exclude ${it}" }.join(' ')
+        if (excludeFiles) {
+            // quoted so wildcards reach rsync instead of being globbed by sh
+            excludeArgs += ' ' + excludeFiles.collect { "--exclude '${it}'" }.join(' ')
+        }
+        if (protectPaths) {
+            echo "deploySite: protectPaths ${protectPaths} — Unix promote does not loosen permissions; nothing to strip"
+        }
         sh """
             mkdir -p '${iisPath}'
             if [ -d '${iisPath}/App_Data' ]; then
@@ -87,6 +125,8 @@ private void _promote(String iisPath, List excludes) {
     }
 
     def xd = excludes.collect { "/XD ${it}" }.join(' ')
+    def xfExtra = excludeFiles ? ' ' + excludeFiles.collect { "\"${it}\"" }.join(' ') : ''
+    def protectBlock = protectPaths ? _protectBat(protectPaths) : ''
     bat """
         @echo off
         setlocal EnableExtensions
@@ -101,7 +141,7 @@ private void _promote(String iisPath, List excludes) {
         )
 
         rem --- FileCopy-style promote (robocopy 0-7 = success) ---
-        robocopy . "%TARGET%" /E /NFL /NDL /NJH /NJS /nc /ns /np ${xd} /XF .gitignore .gitattributes
+        robocopy . "%TARGET%" /E /NFL /NDL /NJH /NJS /nc /ns /np ${xd} /XF .gitignore .gitattributes${xfExtra}
         set RC=%ERRORLEVEL%
         if %RC% GEQ 8 (
           echo robocopy failed with exit %RC%
@@ -116,8 +156,120 @@ private void _promote(String iisPath, List excludes) {
         )
 
         rem --- ACL loosen like legacy freestyle cacls step ---
-        cacls "%TARGET%" /t /e /g Everyone:f >nul 2>&1
+        cacls "%TARGET%" /t /e /g Everyone:f >nul 2>&1${protectBlock}
         echo Promote complete: %TARGET%
         exit /b 0
     """
+}
+
+/**
+ * Batch fragment run after the cacls Everyone:f step, once per protectPath.
+ * Idempotent: /inheritance:d is a no-op once inheritance is already off, and
+ * /remove:g only drops the explicit Everyone grant cacls just re-added.
+ * Never prints file contents; icacls /Q + >nul keep the log to status lines.
+ * Does not /reset or change inheritance on anything below the path, so a file
+ * with its own protected ACL (e.g. the guestbook signing key) keeps that ACL;
+ * only an Everyone ACE (added by cacls /t) is removed from it.
+ */
+private String _protectBat(List protectPaths) {
+    def out = []
+    for (int i = 0; i < protectPaths.size(); i++) {
+        def p = protectPaths[i]
+        out << """
+        rem --- protectPaths: strip Everyone (S-1-1-0) from ${p} ---
+        set "PROTECT=%TARGET%\\${p}"
+        if exist "%PROTECT%" (
+          icacls "%PROTECT%" /inheritance:d /Q >nul
+          if errorlevel 1 (
+            echo protectPaths: icacls /inheritance:d failed on ${p}
+            exit /b 1
+          )
+          icacls "%PROTECT%" /remove:g *S-1-1-0 /Q >nul
+          if errorlevel 1 (
+            echo protectPaths: icacls /remove:g Everyone failed on ${p}
+            exit /b 1
+          )
+          icacls "%PROTECT%" /remove:g *S-1-1-0 /T /C /Q >nul
+          if errorlevel 1 echo WARNING: protectPaths: icacls reported errors below ${p} - verifying
+          icacls "%PROTECT%" /T /C 2>nul | findstr /I /C:"Everyone:" >nul
+          if not errorlevel 1 (
+            echo protectPaths: Everyone ACE still present under ${p} - failing build
+            exit /b 1
+          )
+          echo protectPaths: Everyone removed from ${p}
+        ) else (
+          echo protectPaths: ${p} not present on target - skipped
+        )"""
+    }
+    return out.join('\n')
+}
+
+/** Optional list of simple names (dirs, or files when allowWild) — rejects shell/cmd metacharacters. */
+private List _nameList(def v, String argName, boolean allowWild) {
+    if (v == null) {
+        return []
+    }
+    if (!(v instanceof List)) {
+        error "deploySite: ${argName} must be a List of names"
+    }
+    def out = []
+    for (def item : v) {
+        def n = item?.toString()?.trim()
+        if (!n) {
+            continue
+        }
+        if (!_isSafeName(n, allowWild)) {
+            error "deploySite: ${argName} entry '${n}' must be a plain name (letters, digits, . _ -${allowWild ? ' * ?' : ''})"
+        }
+        out << n
+    }
+    return out
+}
+
+/** Optional list of relative target subpaths; normalised to backslashes, no '..', no absolute paths. */
+private List _protectList(def v) {
+    if (v == null) {
+        return []
+    }
+    if (!(v instanceof List)) {
+        error 'deploySite: protectPaths must be a List of relative paths (e.g. [\'App_Data\'])'
+    }
+    def out = []
+    for (def item : v) {
+        def raw = item?.toString()?.trim()
+        if (!raw) {
+            continue
+        }
+        def p = _normRelPath(raw)
+        if (!p) {
+            error "deploySite: protectPaths entry '${raw}' must be a relative path under iisPath (letters, digits, . _ - and \\ or /; no '..')"
+        }
+        out << p
+    }
+    return out.unique()
+}
+
+@NonCPS
+private boolean _isSafeName(String n, boolean allowWild) {
+    return allowWild ? (n ==~ '[A-Za-z0-9_.*?-]+') : (n ==~ '[A-Za-z0-9_.-]+')
+}
+
+@NonCPS
+private String _normRelPath(String raw) {
+    String p = raw.replace('/', '\\')
+    while (p.endsWith('\\')) {
+        p = p.substring(0, p.length() - 1)
+    }
+    if (!(p ==~ '[A-Za-z0-9_. \\\\-]+')) {
+        return null
+    }
+    if (p.startsWith('\\')) {
+        return null
+    }
+    for (String seg : p.split('\\\\', -1)) {
+        if (seg == '' || seg == '.' || seg == '..' || seg.trim() != seg) {
+            return null
+        }
+    }
+    return p
 }
