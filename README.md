@@ -29,7 +29,7 @@ This repo owns pipeline content only. **Do not** change Jenkins controller confi
 8. Check **Load implicitly** only if you want every job to see it without `@Library`; otherwise jobs use `@Library('sniperd-jenkins') _`
 9. Point each site job at `jenkinsfiles/<site>.Jenkinsfile` in this repo **or** paste that thin file as the job’s Pipeline script / SCM path.
 
-Webhook (existing): `http://moodybeachmaine.com:8989/github-webhook/`
+Webhook: GitHub repo webhooks point at the controller's standard endpoint, `<jenkins-host>/github-webhook/`. The real host and port are kept out of this public repo and live in Ops' private notes.
 
 ## Public vars
 
@@ -68,7 +68,7 @@ deploySite(
 
 ### `withNode`
 
-Pins `NODE_HOME` / `PATH` to **`C:\grok\tools\node`** (v**22.19.0** on COMPUTER).  
+Pins `NODE_HOME` / `PATH` to **`C:\grok\tools\node`** (v**22.19.0** on the Windows build agent).  
 Also sets `PLAYWRIGHT_BROWSERS_PATH=C:\grok\tools\playwright-browsers`.
 
 ## Sample Jenkinsfile pointers
@@ -102,7 +102,7 @@ Every site file is thin: `@Library` + one `deploySite(...)` call.
 
 | Placeholder ID | Purpose |
 |----------------|---------|
-| `github-sniperd2k` | GitHub checkout for every site repo (all are private). Map in Jenkins to the existing GitHub PAT/credential (legacy freestyle used UUID `dbd394d5-7a99-4225-817d-bacbe978d802`). |
+| `github-sniperd2k` | GitHub checkout for every site repo (all site repos are private). Map it in Jenkins to the existing GitHub site-checkout credential: a read-only PAT or GitHub App with access to the site repos. Credential IDs other than this role placeholder are not documented in this public repo. |
 
 **Only this library repo (`sniperd2k/Jenkins`) is public** — Ops can load it over HTTPS with **no credentials**. GitHub secret scanning and push protection are enabled on it; never commit credentials, tokens, or secret values here.
 
