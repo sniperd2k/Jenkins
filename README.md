@@ -92,7 +92,7 @@ Every site file is thin: `@Library` + one `deploySite(...)` call.
 | `jenkinsfiles/emmeunderwood.com.Jenkinsfile` | sniperd2k/emmeunderwood.com | `F:\website\emmeunderwood.com` |
 | `jenkinsfiles/moodybeachmaine.com.Jenkinsfile` | sniperd2k/moodybeachmaine.com | `F:\website\moodybeachmaine.com` |
 | `jenkinsfiles/saynotoskiing.com.Jenkinsfile` | sniperd2k/saynotoskiing.com | `F:\website\saynotoskiing.com` |
-| `jenkinsfiles/evilgame.com.Jenkinsfile` | sniperd2k/evilgame.com (**private**) | `F:\website\evilgame.com` |
+| `jenkinsfiles/evilgame.com.Jenkinsfile` | sniperd2k/evilgame.com | `F:\website\evilgame.com` |
 | `jenkinsfiles/drunkliar.com.Jenkinsfile` | sniperd2k/drunkliar.com | `F:\website\drunkliar.com` |
 | `jenkinsfiles/blowdank.com.Jenkinsfile` | sniperd2k/drunkliar.com (shared; no blowdank repo) | `F:\website\blowdank.com` |
 
@@ -102,11 +102,11 @@ Every site file is thin: `@Library` + one `deploySite(...)` call.
 
 | Placeholder ID | Purpose |
 |----------------|---------|
-| `github-sniperd2k` | GitHub checkout for site repos (esp. **private** `evilgame.com`). Map in Jenkins to the existing GitHub PAT/credential (legacy freestyle used UUID `dbd394d5-7a99-4225-817d-bacbe978d802`). |
+| `github-sniperd2k` | GitHub checkout for every site repo (all are private). Map in Jenkins to the existing GitHub PAT/credential (legacy freestyle used UUID `dbd394d5-7a99-4225-817d-bacbe978d802`). |
 
-**This library repo (`sniperd2k/Jenkins`) is public** — Ops can load it over HTTPS with **no credentials**.
+**Only this library repo (`sniperd2k/Jenkins`) is public** — Ops can load it over HTTPS with **no credentials**. GitHub secret scanning and push protection are enabled on it; never commit credentials, tokens, or secret values here.
 
-Site content repos that are public also work over HTTPS; private repos need `credentialsId`.
+**All 18 other sniperd2k repos, including every site content repo, are private.** Site deploys authenticate their checkout with the `github-sniperd2k` Jenkins credential (`credentialsId: 'github-sniperd2k'`, the `deploySite` default); a checkout without it will fail.
 
 ## Node pin
 
