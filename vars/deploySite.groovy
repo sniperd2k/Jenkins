@@ -21,12 +21,19 @@
  *              (promote has no /MIR or --delete, so nothing is deleted either).
  *   protectPaths  — target subpaths (relative to iisPath, e.g. ['App_Data']) whose
  *              Everyone access is stripped AFTER the legacy cacls Everyone:f step.
- *              Windows, per path: icacls /inheritance:d (inherited ACEs copied as
- *              explicit, so AppPool/SYSTEM/Administrators keep access), then
- *              icacls /remove:g *S-1-1-0 (Everyone) on the path, then /T /C over
- *              the subtree, then verify no Everyone ACE remains. Fails the build if
- *              icacls errors on the path itself or Everyone is still present.
+ *              Windows, per path: [optional appPoolModify grant], then
+ *              icacls /inheritance:d (inherited ACEs copied as explicit, so
+ *              AppPool/SYSTEM/Administrators keep access), then icacls
+ *              /remove:g *S-1-1-0 (Everyone) on the path, then /T /C over the
+ *              subtree, then a PowerShell Get-Acl check by SID (language-
+ *              independent) that no Everyone ACE remains. Fails the build if the
+ *              grant or icacls errors on the path itself, or Everyone remains.
  *              Unix: no-op (the rsync promote does not loosen permissions).
+ *   appPoolModify — IIS app pool name (e.g. 'davidunderwood.net'; [A-Za-z0-9._-]).
+ *              Requires protectPaths. Before each Everyone strip, runs
+ *              icacls "<path>" /grant "IIS AppPool\<name>:(OI)(CI)M" (idempotent:
+ *              re-granting an identical ACE is a no-op). If the grant fails, the
+ *              build fails and the strip never runs.
  *   skipTests — if true, skip runTests (NOT recommended)
  *   siteName — label for logs
  *
@@ -64,6 +71,13 @@ def call(Map args) {
     if (protectPaths) {
         echo "deploySite: protectPaths ${protectPaths} (Everyone stripped after cacls)"
     }
+    def appPoolModify = _appPoolName(args.appPoolModify)
+    if (appPoolModify) {
+        if (!protectPaths) {
+            error 'deploySite: appPoolModify only applies with protectPaths (grant is made on each protected path)'
+        }
+        echo "deploySite: appPoolModify '${appPoolModify}' (Modify granted on protectPaths before Everyone strip)"
+    }
 
     echo "=== deploySite: ${siteName} → ${iisPath} (branch=${branch}) ==="
 
@@ -94,12 +108,12 @@ def call(Map args) {
     }
 
     echo "=== Promote (FileCopy-style) → ${iisPath} ==="
-    _promote(iisPath, excludes, excludeFiles, protectPaths)
+    _promote(iisPath, excludes, excludeFiles, protectPaths, appPoolModify)
 
     echo "=== deploySite done: ${siteName} → ${iisPath} ==="
 }
 
-private void _promote(String iisPath, List excludes, List excludeFiles, List protectPaths) {
+private void _promote(String iisPath, List excludes, List excludeFiles, List protectPaths, String appPoolModify) {
     if (isUnix()) {
         echo "WARNING: Unix agent — rsync-like copy; production promote is Windows robocopy to ${iisPath}"
         def excludeArgs = excludes.collect { "--exclude ${it}" }.join(' ')
@@ -126,7 +140,7 @@ private void _promote(String iisPath, List excludes, List excludeFiles, List pro
 
     def xd = excludes.collect { "/XD ${it}" }.join(' ')
     def xfExtra = excludeFiles ? ' ' + excludeFiles.collect { "\"${it}\"" }.join(' ') : ''
-    def protectBlock = protectPaths ? _protectBat(protectPaths) : ''
+    def protectBlock = protectPaths ? _protectBat(protectPaths, appPoolModify) : ''
     bat """
         @echo off
         setlocal EnableExtensions
@@ -164,21 +178,44 @@ private void _promote(String iisPath, List excludes, List excludeFiles, List pro
 
 /**
  * Batch fragment run after the cacls Everyone:f step, once per protectPath.
- * Idempotent: /inheritance:d is a no-op once inheritance is already off, and
- * /remove:g only drops the explicit Everyone grant cacls just re-added.
- * Never prints file contents; icacls /Q + >nul keep the log to status lines.
+ * Order per path: [grant app pool Modify] -> /inheritance:d -> strip Everyone on
+ * the path -> strip Everyone below it -> verify by SID. Every step that can leave
+ * the path open or the app pool without access exits the bat (build fails)
+ * before the next one runs.
+ * Idempotent: /grant of an identical ACE, /inheritance:d once already off, and
+ * /remove:g of an absent ACE are all no-ops.
+ * Never prints file contents; icacls /Q + >nul and the verify script only print
+ * status lines / a count.
  * Does not /reset or change inheritance on anything below the path, so a file
  * with its own protected ACL (e.g. the guestbook signing key) keeps that ACL;
  * only an Everyone ACE (added by cacls /t) is removed from it.
  */
-private String _protectBat(List protectPaths) {
+private String _protectBat(List protectPaths, String appPoolModify) {
+    // Language-independent verify: count ACEs whose SID is S-1-1-0 (Everyone) on the
+    // path and every item below it. Unreadable items throw -> exit 1 (fail closed).
+    // Single-quoted Groovy string: no interpolation; contains no double quotes / % for cmd.
+    def verifyPs = '$ErrorActionPreference=\'Stop\'; ' +
+        '$sid=New-Object System.Security.Principal.SecurityIdentifier(\'S-1-1-0\'); ' +
+        '$t=[System.Security.Principal.SecurityIdentifier]; ' +
+        '$items=@(Get-Item -LiteralPath $env:PROTECT -Force) + @(Get-ChildItem -LiteralPath $env:PROTECT -Recurse -Force); ' +
+        '$n=0; foreach($i in $items){ foreach($r in (Get-Acl -LiteralPath $i.FullName).GetAccessRules($true,$true,$t)){ if($r.IdentityReference -eq $sid){ $n++ } } }; ' +
+        'if($n -gt 0){ Write-Host (\'protectPaths: Everyone ACEs remaining: \' + $n); exit 1 }; exit 0'
     def out = []
     for (int i = 0; i < protectPaths.size(); i++) {
         def p = protectPaths[i]
+        def grant = ''
+        if (appPoolModify) {
+            grant = """
+          icacls "%PROTECT%" /grant "IIS AppPool\\${appPoolModify}:(OI)(CI)M" /Q >nul
+          if errorlevel 1 (
+            echo protectPaths: icacls /grant app pool Modify failed on ${p} - Everyone NOT stripped
+            exit /b 1
+          )"""
+        }
         out << """
         rem --- protectPaths: strip Everyone (S-1-1-0) from ${p} ---
         set "PROTECT=%TARGET%\\${p}"
-        if exist "%PROTECT%" (
+        if exist "%PROTECT%" (${grant}
           icacls "%PROTECT%" /inheritance:d /Q >nul
           if errorlevel 1 (
             echo protectPaths: icacls /inheritance:d failed on ${p}
@@ -191,9 +228,9 @@ private String _protectBat(List protectPaths) {
           )
           icacls "%PROTECT%" /remove:g *S-1-1-0 /T /C /Q >nul
           if errorlevel 1 echo WARNING: protectPaths: icacls reported errors below ${p} - verifying
-          icacls "%PROTECT%" /T /C 2>nul | findstr /I /C:"Everyone:" >nul
-          if not errorlevel 1 (
-            echo protectPaths: Everyone ACE still present under ${p} - failing build
+          "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${verifyPs}"
+          if errorlevel 1 (
+            echo protectPaths: Everyone S-1-1-0 still present under ${p} or ACLs unreadable - failing build
             exit /b 1
           )
           echo protectPaths: Everyone removed from ${p}
@@ -202,6 +239,21 @@ private String _protectBat(List protectPaths) {
         )"""
     }
     return out.join('\n')
+}
+
+/** Optional IIS app pool name for appPoolModify: [A-Za-z0-9._-], not all dots, no trailing dot. */
+private String _appPoolName(def v) {
+    if (v == null) {
+        return null
+    }
+    def n = v.toString().trim()
+    if (!n) {
+        return null
+    }
+    if (!(n ==~ '[A-Za-z0-9._-]+') || !_isSaneSegment(n)) {
+        error "deploySite: appPoolModify '${n}' must be an app pool name ([A-Za-z0-9._-], not all dots, no trailing dot)"
+    }
+    return n
 }
 
 /** Optional list of simple names (dirs, or files when allowWild) — rejects shell/cmd metacharacters. */
@@ -219,7 +271,7 @@ private List _nameList(def v, String argName, boolean allowWild) {
             continue
         }
         if (!_isSafeName(n, allowWild)) {
-            error "deploySite: ${argName} entry '${n}' must be a plain name (letters, digits, . _ -${allowWild ? ' * ?' : ''})"
+            error "deploySite: ${argName} entry '${n}' must be a plain name (letters, digits, . _ -${allowWild ? ' * ?' : ''}; not all dots${allowWild ? '/wildcards' : ''}; no trailing dot)"
         }
         out << n
     }
@@ -242,7 +294,7 @@ private List _protectList(def v) {
         }
         def p = _normRelPath(raw)
         if (!p) {
-            error "deploySite: protectPaths entry '${raw}' must be a relative path under iisPath (letters, digits, . _ - and \\ or /; no '..')"
+            error "deploySite: protectPaths entry '${raw}' must be a relative path under iisPath (letters, digits, . _ - and \\ or /; no all-dot or trailing-dot segments)"
         }
         out << p
     }
@@ -251,7 +303,20 @@ private List _protectList(def v) {
 
 @NonCPS
 private boolean _isSafeName(String n, boolean allowWild) {
-    return allowWild ? (n ==~ '[A-Za-z0-9_.*?-]+') : (n ==~ '[A-Za-z0-9_.-]+')
+    if (!(allowWild ? (n ==~ '[A-Za-z0-9_.*?-]+') : (n ==~ '[A-Za-z0-9_.-]+'))) {
+        return false
+    }
+    // '.', '..', '*', '*.*', '?' etc. would match everything / nothing useful
+    if (n ==~ '[.*?]+') {
+        return false
+    }
+    return _isSaneSegment(n)
+}
+
+/** Rejects segments that are all dots or end with a dot (Win32 strips trailing dots). */
+@NonCPS
+private boolean _isSaneSegment(String seg) {
+    return !(seg ==~ '\\.+') && !seg.endsWith('.')
 }
 
 @NonCPS
@@ -267,7 +332,7 @@ private String _normRelPath(String raw) {
         return null
     }
     for (String seg : p.split('\\\\', -1)) {
-        if (seg == '' || seg == '.' || seg == '..' || seg.trim() != seg) {
+        if (seg == '' || seg.trim() != seg || !_isSaneSegment(seg)) {
             return null
         }
     }

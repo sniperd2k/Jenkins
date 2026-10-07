@@ -74,15 +74,19 @@ deploySite(
 | `extraExcludes` | List of dir names | **Appended** to `excludes` / the defaults. robocopy `/XD` + rsync `--exclude`; matches that directory name at any depth. |
 | `excludeFiles` | List of file names / wildcards | **Appended** to robocopy `/XF .gitignore .gitattributes` and rsync `--exclude`. Excluded files are never copied, so a live copy on the target is never overwritten (the promote has no `/MIR` / `--delete`, so nothing on the target is deleted either). |
 | `protectPaths` | List of paths relative to `iisPath` | Strips **Everyone** from those paths *after* the legacy `cacls "%TARGET%" /t /e /g Everyone:f` step (Windows only; the Unix rsync promote never loosens permissions, so it is a no-op there). |
+| `appPoolModify` | String: IIS app pool name (`[A-Za-z0-9._-]`) | Requires `protectPaths`. Before each Everyone strip, grants `IIS AppPool\<name>:(OI)(CI)M` on the path, so the site keeps write access once Everyone is gone. |
+
+Validation (build fails on a bad value): names may only use letters, digits, `.`, `_` and `-` (plus `*` / `?` in `excludeFiles`). Names made only of dots or wildcards (`.`, `..`, `*`, `*.*`) and names ending in a dot are rejected. `protectPaths` must be relative, with no drive or leading `\`, no empty segments, and no segment that is all dots or ends in a dot.
 
 `protectPaths` details, per path, run after `cacls` on every deploy (idempotent):
 
+0. *(only with `appPoolModify`)* `icacls "<path>" /grant "IIS AppPool\<name>:(OI)(CI)M"`: re-granting an identical ACE does nothing, so this is safe when Ops has already added it. If it fails, the build fails and **nothing below runs**, so Everyone is never stripped without the pool's grant in place.
 1. `icacls "<path>" /inheritance:d` — stops inheriting from the site root (where `cacls /t` leaves an inheritable `Everyone:F`). The inherited ACEs are copied as explicit, so the IIS AppPool identity, SYSTEM and Administrators keep their access. No-op once inheritance is already off.
 2. `icacls "<path>" /remove:g *S-1-1-0` — removes every Everyone (SID `S-1-1-0`, locale-independent) grant from the path itself.
 3. `icacls "<path>" /remove:g *S-1-1-0 /T /C` — removes the explicit Everyone grant that `cacls /t` re-added to every child.
-4. Verifies with `icacls "<path>" /T /C | findstr "Everyone:"` that no Everyone ACE remains.
+4. Verifies, independent of OS language, that no ACE for SID `S-1-1-0` remains on the path or anything below it. It uses PowerShell `Get-Acl` with `GetAccessRules(..., [SecurityIdentifier])`. An item whose ACL can't be read also fails the check (fail closed). Only a count is printed.
 
-The build **fails** if step 1 or 2 errors on the path itself, or if step 4 still finds Everyone. Errors on individual children in step 3 only warn, and step 4 then decides. Nothing below the path gets `/reset` or an inheritance change, so a file with its own protected ACL (e.g. a signing key) keeps it; only the Everyone ACE that `cacls /t` added is removed. A path missing on the target is skipped. Output is suppressed (`/Q`, `>nul`), so no file names or contents are echoed.
+The build **fails** if step 0, 1 or 2 errors on the path itself, or if step 4 finds Everyone or can't read an ACL. Errors on individual children in step 3 only warn, and step 4 then decides. Nothing below the path gets `/reset` or an inheritance change, so a file with its own protected ACL (e.g. a signing key) keeps it; only the Everyone ACE that `cacls /t` added is removed. A path missing on the target is skipped. Output is suppressed (`/Q`, `>nul`), so no file names or contents are echoed.
 
 Example (`jenkinsfiles/davidunderwood.net.Jenkinsfile`, SEC-1):
 
@@ -93,7 +97,8 @@ deploySite(
     siteName: 'davidunderwood.net',
     extraExcludes: ['scripts'],                // ops scripts never reach IIS
     excludeFiles: ['guestbook-signing-key*'],  // live key is server-only; never copied/overwritten
-    protectPaths: ['App_Data']                 // undo cacls Everyone:f on App_Data
+    protectPaths: ['App_Data'],                // undo cacls Everyone:f on App_Data
+    appPoolModify: 'davidunderwood.net'        // pool keeps Modify on App_Data without Everyone
 )
 ```
 
@@ -110,7 +115,7 @@ Also sets `PLAYWRIGHT_BROWSERS_PATH=C:\grok\tools\playwright-browsers`.
 |------|------|-------|
 | Static site | `jenkinsfiles/amandaunderwood.com.Jenkinsfile` | no `package.json` → warn + continue, then FileCopy |
 | Sniperd (gated) | `jenkinsfiles/sniperd.com.Jenkinsfile` | `test:gate` before FileCopy |
-| ASP.NET / App_Data | `jenkinsfiles/davidunderwood.net.Jenkinsfile` | preserves `App_Data\*.json`; `extraExcludes` / `excludeFiles` / `protectPaths` (SEC-1) |
+| ASP.NET / App_Data | `jenkinsfiles/davidunderwood.net.Jenkinsfile` | preserves `App_Data\*.json`; `extraExcludes` / `excludeFiles` / `protectPaths` / `appPoolModify` (SEC-1) |
 
 Every site file is thin: `@Library` + one `deploySite(...)` call.
 

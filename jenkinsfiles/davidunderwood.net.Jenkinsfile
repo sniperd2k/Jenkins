@@ -3,7 +3,8 @@
 // IIS:  F:\\website\\davidunderwood.net
 // Note: ASP.NET guestbook — App_Data/*.json preserved
 // SEC-1: scripts/ never deployed; guestbook signing key never copied/overwritten
-//        (lives on the server only); Everyone stripped from App_Data after cacls.
+//        (lives on the server only); app pool granted Modify on App_Data, then
+//        Everyone stripped from App_Data after cacls.
 @Library('sniperd-jenkins') _
 
 pipeline {
@@ -22,7 +23,8 @@ pipeline {
                     credentialsId: 'github-sniperd2k',
                     extraExcludes: ['scripts'],
                     excludeFiles: ['guestbook-signing-key*'],
-                    protectPaths: ['App_Data']
+                    protectPaths: ['App_Data'],
+                    appPoolModify: 'davidunderwood.net'
                 )
             }
         }
