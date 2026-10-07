@@ -1,7 +1,7 @@
 // evilgame.com — thin site pipeline (shared library only)
 // Repo: https://github.com/sniperd2k/evilgame.com
 // IIS:  F:\\website\\evilgame.com
-// Note: private repo — needs credentialsId; test:gate
+// Note: test:gate must pass before promote. Checkout uses credentialsId like every site (all site repos are private).
 @Library('sniperd-jenkins') _
 
 pipeline {
